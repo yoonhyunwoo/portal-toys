@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>learn-linux · WebAssembly Linux 실습</title>
+  <!-- SPDX-License-Identifier: GPL-2.0-only -->
+
+  <script>
+    // Append ?v=-1 to the URL to cache-bust smug browsers that ignore your Cache-Control headers.
+    let wasm_linux_version = parseInt(new URLSearchParams(document.location.search).get("v") || 1);
+    wasm_linux_version = (wasm_linux_version < 0) ? (+new Date()) : wasm_linux_version;
+    document.write("<l" + "ink rel=\"stylesheet\" href=\"bright.css?v=" + wasm_linux_version + "\">");
+    document.write("<l" + "ink rel=\"stylesheet\" href=\"xterm.css?v=" + wasm_linux_version + "\">");
+    document.write("<scr" + "ipt src=\"linux.js?v=" + wasm_linux_version + "\"></scr" + "ipt>");
+    document.write("<scr" + "ipt src=\"xterm.js?v=" + wasm_linux_version + "\"></scr" + "ipt>");
+
+    const learnLinuxTemplates = [
+      {
+        id: "shell-warmup",
+        title: "쉘 기본기 익히기",
+        markdown: `## 목표\n- 현재 작업 디렉터리를 이해합니다.\n- 파일을 만들고 내용을 확인합니다.\n\n## 따라하기\n1. \`pwd\`\n2. \`ls -al\`\n3. \`cat /etc/os-release\`\n4. \`echo "hello wasm" > notes.txt\`\n5. \`head notes.txt\``
+      },
+      {
+        id: "process-clinic",
+        title: "프로세스 관찰",
+        markdown: `## 관찰 포인트\n- top 으로 load average 체크\n- ps 로 커널 태스크 찾기\n\n## 명령 모음\n- \`top\`\n- \`ps -ef | head\`\n- \`watch -n1 'ps | grep kthreadd'\`\n- \`head /proc/cpuinfo\``
+      },
+      {
+        id: "network-peek",
+        title: "네트워크 탐색",
+        markdown: `## BusyBox 네트워크 명령\n- 기본 인터페이스 확인\n- 소켓 상태 살펴보기\n\n## 명령\n- \`ifconfig -a\`\n- \`netstat -tulpn\`\n- \`ss -an | head\`\n- \`ping -c 3 1.1.1.1\``
+      }
+    ];
+
+    function encodeTutorialData(data) {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+    }
+
+    function decodeTutorialData(raw) {
+      return JSON.parse(decodeURIComponent(escape(atob(raw))));
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function formatInline(text) {
+      return text
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*(.+?)\*/g, "<em>$1</em>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>");
+    }
+
+    function simpleMarkdown(source) {
+      if (!source || !source.trim()) {
+        return '<p class="muted">마크다운을 입력하면 여기서 렌더링됩니다.</p>';
+      }
+
+      const lines = source.replace(/\r/g, "").split("\n");
+      let html = "";
+      let inList = false;
+      let inCode = false;
+      let codeBuffer = [];
+
+      const flushList = () => {
+        if (inList) {
+          html += "</ul>";
+          inList = false;
+        }
+      };
+
+      lines.forEach(line => {
+        if (line.trim().startsWith("```") || line.trim().startsWith("~~~")) {
+          if (inCode) {
+            html += `<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`;
+            codeBuffer = [];
+            inCode = false;
+          } else {
+            flushList();
+            inCode = true;
+          }
+          return;
+        }
+
+        if (inCode) {
+          codeBuffer.push(line);
+          return;
+        }
+
+        if (/^\s*-\s+/.test(line)) {
+          if (!inList) {
+            html += "<ul>";
+            inList = true;
+          }
+          const item = line.replace(/^\s*-\s+/, "");
+          html += `<li>${formatInline(escapeHtml(item))}</li>`;
+          return;
+        } else {
+          flushList();
+        }
+
+        const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+        if (headingMatch) {
+          const level = headingMatch[1].length;
+          const content = formatInline(escapeHtml(headingMatch[2]));
+          html += `<h${level}>${content}</h${level}>`;
+          return;
+        }
+
+        if (!line.trim()) {
+          html += '<div class="md-gap"></div>';
+          return;
+        }
+
+        html += `<p>${formatInline(escapeHtml(line))}</p>`;
+      });
+
+      flushList();
+
+      if (inCode) {
+        html += `<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`;
+      }
+
+      return html;
+    }
+
+    function initLearnLinuxUI() {
+      const params = new URLSearchParams(location.search);
+      const sharedLink = params.has("tutorialData") || params.has("tutorialId");
+      const forceEdit = params.get("edit") === "1";
+      const editable = !sharedLink || forceEdit;
+
+      if (!editable) {
+        document.body.classList.add("view-only");
+      } else {
+        document.body.classList.remove("view-only");
+      }
+
+      const titleInput = document.getElementById("tutorial-title");
+      const markdownInput = document.getElementById("tutorial-markdown");
+      const docViewTitle = document.getElementById("doc-view-title");
+      const docViewBody = document.getElementById("doc-view-body");
+      const copyBtn = document.getElementById("copy-link");
+      const copyFeedback = document.getElementById("copy-feedback");
+      let feedbackTimer = null;
+
+      if (!editable) {
+        titleInput.setAttribute("readonly", "true");
+        markdownInput.setAttribute("readonly", "true");
+      }
+
+      const syncMarkdownViews = () => {
+        const html = simpleMarkdown(markdownInput.value);
+        if (docViewBody) {
+          docViewBody.innerHTML = html;
+        }
+        if (docViewTitle) {
+          docViewTitle.textContent = titleInput.value.trim() || "제목 없는 튜토리얼";
+        }
+      };
+
+      function collectTutorial() {
+        return {
+          title: titleInput.value.trim() || "제목 없는 튜토리얼",
+          markdown: markdownInput.value,
+          updatedAt: new Date().toISOString()
+        };
+      }
+
+      function normalizeTutorial(raw = {}) {
+        if (!raw) return { title: "", markdown: "" };
+        if (raw.markdown) return raw;
+        if (raw.body) return { title: raw.title || "", markdown: raw.body, updatedAt: raw.updatedAt };
+        if (Array.isArray(raw.steps)) {
+          const numbered = raw.steps.map((step, idx) => `${idx + 1}. ${step}`).join("\n");
+          return { title: raw.title || "", markdown: numbered, updatedAt: raw.updatedAt };
+        }
+        return { title: raw.title || "", markdown: raw.summary || "", updatedAt: raw.updatedAt };
+      }
+
+      function fillTutorial(raw) {
+        const data = normalizeTutorial(raw);
+        titleInput.value = data.title || "";
+        markdownInput.value = data.markdown || "";
+        syncMarkdownViews();
+        if (editable) {
+          updateShareLink();
+        }
+      }
+
+      function buildShareUrl() {
+        const data = collectTutorial();
+        const encoded = encodeTutorialData(data);
+        const url = new URL(location.href);
+        url.searchParams.set("tutorialData", encoded);
+        url.searchParams.delete("tutorialId");
+        return url.toString();
+      }
+
+      function updateShareLink() {
+        if (!editable) return;
+        const url = buildShareUrl();
+        history.replaceState({}, "", url);
+        return url;
+      }
+
+      function showCopyFeedback(message) {
+        if (!copyFeedback) return;
+        copyFeedback.textContent = message;
+        copyFeedback.classList.add("copy-feedback--visible");
+        clearTimeout(feedbackTimer);
+        feedbackTimer = setTimeout(() => copyFeedback.classList.remove("copy-feedback--visible"), 2200);
+      }
+
+      if (editable) {
+        const newBtn = document.getElementById("new-tutorial");
+        if (newBtn) {
+          newBtn.addEventListener("click", () => {
+            fillTutorial({ title: "", markdown: "" });
+          });
+        }
+
+        if (copyBtn) {
+          copyBtn.addEventListener("click", async () => {
+            const link = updateShareLink() || buildShareUrl();
+            try {
+              await navigator.clipboard.writeText(link);
+              showCopyFeedback("링크를 복사했습니다");
+            } catch (error) {
+              console.error("Failed to copy share link", error);
+              showCopyFeedback("복사에 실패했습니다");
+            }
+          });
+        }
+
+        [titleInput, markdownInput].forEach(el => el.addEventListener("input", () => {
+          syncMarkdownViews();
+          updateShareLink();
+        }));
+      } else {
+        syncMarkdownViews();
+      }
+
+      if (params.has("tutorialData")) {
+        try {
+          const data = decodeTutorialData(params.get("tutorialData"));
+          fillTutorial(data);
+        } catch (error) {
+          console.error("Failed to parse tutorialData", error);
+          fillTutorial(learnLinuxTemplates[0]);
+        }
+      } else if (params.has("tutorialId")) {
+        fillTutorial(learnLinuxTemplates[0]);
+      } else {
+        fillTutorial(learnLinuxTemplates[0]);
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", async () => {
+      initLearnLinuxUI();
+
+      const term = new Terminal({ theme: { background: "#010b17", foreground: "#ace1ff" } });
+      term.open(document.getElementById("terminal"));
+
+      const log = (text) => term.write(("\x1B[2m" + text + "\x1B[0m\n").replaceAll("\n", "\r\n"));
+      const console_write = (data) => term.write(data);  // Pre-decoded UTF-8 data.
+
+      if (!window.crossOriginIsolated) {
+        log("경고: COOP/COEP 헤더가 없어 SharedArrayBuffer 지원이 제한될 수 있습니다.");
+      }
+
+      try {
+        const worker_url = "linux-worker.js?v=" + wasm_linux_version;
+        const vmlinux = await WebAssembly.compileStreaming(fetch("vmlinux.wasm?v=" + wasm_linux_version));
+        const boot_cmdline =
+          "maxcpus=3 nohz_full=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0";
+        const initrd_request = await fetch("initramfs.cpio.gz?v=" + wasm_linux_version);
+        if (!initrd_request.ok) {
+          throw new Error("Failed to fetch initrd from server, status: " + initrd_request.status);
+        }
+        const initrd = await initrd_request.arrayBuffer();
+
+        const os = await linux(worker_url, vmlinux, boot_cmdline, initrd, log, console_write);
+        term.onData(data => os.key_input(data));
+        document.getElementById("reboot").addEventListener("click", () => {
+          log("\n샌드박스를 다시 시작합니다...\n");
+          window.location.reload();
+        });
+      } catch (error) {
+        log("Linux/Wasm failed with (" + error.name + "): " + error.message + "\n" + error.stack);
+        throw error;
+      }
+    }, false);
+  </script>
+</head>
+
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">learn-linux</p>
+        <h1>learn-linux</h1>
+      </div>
+      <div class="masthead__links">
+        <span class="chip">빠른 Quickstart</span>
+        <button type="button" id="new-tutorial" class="ghost-btn">새 튜토리얼</button>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="panel docs">
+        <header>
+          <h2>문서 패널</h2>
+          <p>Markdown으로 튜토리얼을 작성하고 링크만 공유하세요.</p>
+        </header>
+ 
+        <div class="doc-view">
+          <p class="eyebrow">view mode</p>
+          <h3 id="doc-view-title">제목 없는 튜토리얼</h3>
+          <div id="doc-view-body" class="markdown-preview"></div>
+        </div>
+ 
+        <div class="editor-only">
+          <label class="field">
+            <span>제목</span>
+            <input id="tutorial-title" type="text" placeholder="예: Wasm에서 top 사용해보기">
+          </label>
+          <div class="field markdown-field">
+            <div class="field__label">
+              <span>본문 (Markdown)</span>
+            </div>
+            <textarea id="tutorial-markdown" rows="16" placeholder="# 섹션 제목\n- 이렇게 리스트를 작성하세요"></textarea>
+          </div>
+          <div class="share-controls">
+            <button type="button" id="copy-link" class="ghost-btn">링크 복사</button>
+            <p id="copy-feedback" class="copy-feedback"></p>
+          </div>
+        </div>
+      </aside>
+
+      <section class="panel console">
+        <header class="console__header">
+          <div>
+            <p class="eyebrow">linux-wasm</p>
+            <h2>실행 패널</h2>
+          </div>
+          <button type="button" id="reboot" class="ghost-btn">재부팅</button>
+        </header>
+        <div id="terminal" tabindex="0" aria-label="Linux terminal"></div>
+      </section>
+    </section>
+  </div>
+</body>
